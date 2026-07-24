@@ -4,14 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# The Native GUI Framework
-eframe = "0.27" 
-
-# Async & Networking
-tokio = { version = "1.0", features = ["full"] }
-reqwest = { version = "0.12", features = ["json"] }
-
-# Data Parsing
+eframe = "0.35.0" # (or whatever version you are on)
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.13.4", features = ["json"] }
+# --- NEW ONES BELOW ---
+dirs = "6.0"         # For finding standard OS directories (Documents, Home)
+open = "5.1"         # To open folders in Windows Explorer/macOS Finder/Linux File Manager
+self_update = "0.44" # The magic crate for auto-updating from GitHub releases
