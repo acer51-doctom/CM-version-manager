@@ -218,7 +218,7 @@ fn fetch_github_releases(client: &reqwest::blocking::Client) -> Result<Vec<Build
                 version: version_name,
                 channel: Channel::Release,
                 release_date: release.published_at,
-                download_url: asset.browser_download_url,
+                download_url: asset.browser_download_url.clone(),
                 file_name: asset.name.clone(),
                 changelog: release.body.unwrap_or_else(|| "No changelog provided.".to_string()),
             });
