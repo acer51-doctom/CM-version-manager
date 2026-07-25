@@ -73,8 +73,19 @@ pub fn fetch_builds_async(sender: Sender<FetchResult>) {
 }
 
 fn fetch_builds_sync() -> FetchResult {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::ACCEPT,
+        "application/vnd.github+json".parse().unwrap(),
+    );
+    headers.insert(
+        "X-GitHub-Api-Version",
+        "2022-11-28".parse().unwrap(),
+    );
+
     let client = match reqwest::blocking::Client::builder()
-        .user_agent("ChroMapper-Version-Manager/1.0")
+        .user_agent("ChroMapper-Version-Manager")
+        .default_headers(headers)
         .build()
     {
         Ok(c) => c,
@@ -123,7 +134,14 @@ fn fetch_builds_sync() -> FetchResult {
                 Err(e) => FetchResult::Error(format!("Failed to parse release JSON: {e}")),
             }
         }
-        Ok(res) => FetchResult::Error(format!("GitHub API error: HTTP {}", res.status())),
+        Ok(res) => {
+            let status = res.status();
+            if status == reqwest::StatusCode::FORBIDDEN {
+                FetchResult::Error("GitHub API returned 403 Forbidden. You may have hit the unauthenticated rate limit.".to_string())
+            } else {
+                FetchResult::Error(format!("GitHub API error: HTTP {status}"))
+            }
+        }
         Err(e) => FetchResult::Error(format!("Network request failed: {e}")),
     }
 }

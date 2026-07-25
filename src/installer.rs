@@ -1,6 +1,6 @@
 use std::fs::File;
-use std::path::{Path, PathBuf};
-use std::io::{Write, Cursor};
+use std::path::PathBuf;
+use std::io::Cursor;
 use std::sync::mpsc::Sender;
 use zip::ZipArchive;
 

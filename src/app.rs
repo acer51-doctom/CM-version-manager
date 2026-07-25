@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
 use crate::api::{self, Build, Channel, FetchResult, InstallProgress};
 use crate::launcher::{self, InstalledBuild};
+use crate::logger;
 use crate::models::{AppTab, AppSettings};
 use crate::updater;
 
@@ -14,6 +15,7 @@ pub struct CmManagerApp {
     selected_channel: Channel,
     selected_build_id: String,
     is_fetching_builds: bool,
+    initial_fetch_attempted: bool, // Guard flag to prevent infinite loops on error
     builds: Vec<Build>,
     fetch_receiver: Option<Receiver<FetchResult>>,
 
@@ -40,6 +42,7 @@ impl Default for CmManagerApp {
             selected_channel: Channel::Stable,
             selected_build_id: String::new(),
             is_fetching_builds: false,
+            initial_fetch_attempted: false,
             builds: Vec::new(),
             fetch_receiver: None,
             installed_builds: Vec::new(),
@@ -54,6 +57,7 @@ impl Default for CmManagerApp {
 
 impl CmManagerApp {
     fn refresh_installed_builds(&mut self) {
+        logger::info("Refreshing list of installed builds...");
         self.installed_builds = launcher::scan_installed_builds(&self.settings.install_directory);
     }
 
@@ -61,6 +65,7 @@ impl CmManagerApp {
         if self.is_fetching_builds {
             return;
         }
+        logger::action("Initiating fetch for ChroMapper releases from API...");
         self.is_fetching_builds = true;
         let (tx, rx) = channel();
         self.fetch_receiver = Some(rx);
@@ -73,10 +78,22 @@ impl CmManagerApp {
             ui.horizontal(|ui| {
                 ui.heading("CM Manager");
                 ui.add_space(20.0);
+                
+                let prev_tab = self.current_tab;
                 ui.selectable_value(&mut self.current_tab, AppTab::Versions, "📦 Installs");
                 ui.selectable_value(&mut self.current_tab, AppTab::PluginStore, "🔌 Plugins");
                 ui.selectable_value(&mut self.current_tab, AppTab::Migration, "🔄 Migrator");
                 ui.selectable_value(&mut self.current_tab, AppTab::Settings, "⚙ Settings");
+
+                if prev_tab != self.current_tab {
+                    let tab_name = match self.current_tab {
+                        AppTab::Versions => "Versions",
+                        AppTab::PluginStore => "PluginStore",
+                        AppTab::Migration => "Migration",
+                        AppTab::Settings => "Settings",
+                    };
+                    logger::info(format!("Switched tab to {tab_name}"));
+                }
             });
             ui.add_space(5.0);
         });
@@ -105,7 +122,7 @@ impl CmManagerApp {
                     egui::Frame::group(ui.style()).show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.vertical(|ui| {
-                                ui.label(egui::RichText::new(&build.name).bold());
+                                ui.label(egui::RichText::new(&build.name).strong());
                                 ui.small(build.executable_path.to_string_lossy());
                             });
 
@@ -115,6 +132,7 @@ impl CmManagerApp {
                                 }
 
                                 if ui.button("📂").on_hover_text("Open Folder").clicked() {
+                                    logger::action(format!("Opening directory for build: '{}'", build.name));
                                     let _ = open::that(&build.path);
                                 }
 
@@ -160,12 +178,14 @@ impl CmManagerApp {
                 self.is_fetching_builds = false;
                 match result {
                     FetchResult::Success(fetched) => {
+                        logger::info(format!("Fetched {} release(s) successfully.", fetched.len()));
                         self.builds = fetched;
                         if let Some(first) = self.builds.iter().find(|b| b.channel == self.selected_channel) {
                             self.selected_build_id = first.id.clone();
                         }
                     }
                     FetchResult::Error(err) => {
+                        logger::error(format!("Failed to fetch releases: {err}"));
                         self.install_status_msg = format!("Failed to load releases: {err}");
                     }
                 }
@@ -194,6 +214,7 @@ impl CmManagerApp {
                 });
 
             if prev_channel != self.selected_channel {
+                logger::info(format!("Selected channel changed to: {}", self.selected_channel));
                 if let Some(first) = self.builds.iter().find(|b| b.channel == self.selected_channel) {
                     self.selected_build_id = first.id.clone();
                 } else {
@@ -236,6 +257,7 @@ impl CmManagerApp {
         ui.add_enabled_ui(!is_installing && selected_build.is_some(), |ui| {
             if ui.button("⬇ Download & Auto-Extract Selected Build").clicked() {
                 if let Some(build) = selected_build {
+                    logger::action(format!("Starting download for build '{}' ({})", build.version, build.download_url));
                     let (tx, rx) = channel();
                     self.install_receiver = Some(rx);
                     self.install_status_msg = "Starting install process...".to_string();
@@ -275,16 +297,19 @@ impl CmManagerApp {
                         }
                     }
                     InstallProgress::Extracting => {
+                        logger::info("Download completed; extracting archive...");
                         self.download_fraction = None;
                         self.install_status_msg = "📦 Unzipping and extracting files...".to_string();
                     }
                     InstallProgress::Finished(path) => {
+                        logger::info(format!("Installation successfully completed at '{}'", path.display()));
                         self.download_fraction = None;
                         self.install_status_msg = format!("✅ Successfully installed to: {path:?}");
                         self.install_receiver = None;
                         self.refresh_installed_builds(); // Automatically refresh UI list!
                     }
                     InstallProgress::Failed(err) => {
+                        logger::error(format!("Installation failed: {err}"));
                         self.download_fraction = None;
                         self.install_status_msg = format!("❌ Installation failed: {err}");
                         self.install_receiver = None;
@@ -326,7 +351,9 @@ impl CmManagerApp {
                     ui.label("Pulls latest .dll from GitHub release");
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Install").clicked() {}
+                    if ui.button("Install").clicked() {
+                        logger::action("User requested install for plugin: ChroMapper-LightID");
+                    }
                 });
             });
         });
@@ -367,7 +394,9 @@ impl CmManagerApp {
         ui.checkbox(&mut true, "Copy Plugins folder");
         ui.checkbox(&mut true, "Copy Settings.json");
         ui.add_space(10.0);
-        if ui.button("🚀 Start Migration").clicked() {}
+        if ui.button("🚀 Start Migration").clicked() {
+            logger::action("User initiated migration workflow.");
+        }
     }
 
     fn render_settings_tab(&mut self, ui: &mut egui::Ui) {
@@ -377,6 +406,7 @@ impl CmManagerApp {
         ui.horizontal(|ui| {
             ui.label("Base Install Directory:");
             if ui.text_edit_singleline(&mut self.settings.install_directory).changed() {
+                logger::info(format!("Install directory updated to: {}", self.settings.install_directory));
                 self.refresh_installed_builds();
             }
         });
@@ -386,6 +416,7 @@ impl CmManagerApp {
 
         if ui.button("📂 Open Global Plugins Folder").clicked() {
             let global_path = format!("{}/global_plugins", self.settings.install_directory);
+            logger::action(format!("Opening global plugins directory at: {global_path}"));
             std::fs::create_dir_all(&global_path).unwrap_or_default();
             let _ = open::that(&global_path);
         }
@@ -408,10 +439,18 @@ impl CmManagerApp {
         ui.add_space(10.0);
 
         if ui.button("🔄 Check for App Updates").clicked() {
+            logger::action("Checking for application self-updates...");
             self.update_status = "Checking GitHub...".to_string();
             match updater::check_for_updates() {
-                Ok(msg) => self.update_status = msg,
-                Err(e) => self.update_status = format!("Update failed: {}", e),
+                Ok(msg) => {
+                    logger::info(&msg);
+                    self.update_status = msg;
+                }
+                Err(e) => {
+                    let err_msg = format!("Update failed: {e}");
+                    logger::error(&err_msg);
+                    self.update_status = err_msg;
+                }
             }
         }
         if !self.update_status.is_empty() {
@@ -422,8 +461,10 @@ impl CmManagerApp {
 
 impl eframe::App for CmManagerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Initial setup on boot
-        if self.builds.is_empty() && !self.is_fetching_builds && self.fetch_receiver.is_none() {
+        // Initial setup on boot (runs only once, protecting against infinite fetch retry loops)
+        if !self.initial_fetch_attempted && !self.is_fetching_builds && self.fetch_receiver.is_none() {
+            self.initial_fetch_attempted = true;
+            logger::info("App initialized; performing initial scan and fetch.");
             self.refresh_installed_builds();
             self.trigger_build_fetch();
         }
