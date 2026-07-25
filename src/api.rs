@@ -10,13 +10,15 @@ use zip::ZipArchive;
 pub enum Channel {
     Stable,
     Dev,
+    Release,
 }
 
 impl std::fmt::Display for Channel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Channel::Stable => write!(f, "Stable"),
-            Channel::Dev => write!(f, "Dev"),
+            Channel::Stable => write!(f, "Stable (CDN)"),
+            Channel::Dev => write!(f, "Dev (Jenkins)"),
+            Channel::Release => write!(f, "GitHub Releases"),
         }
     }
 }
@@ -47,120 +49,209 @@ pub enum InstallProgress {
     Failed(String),
 }
 
-// GitHub API models
+// --- Jenkins API Models (Dev) ---
 #[derive(Debug, Deserialize)]
-struct GhRelease {
-    tag_name: String,
-    name: Option<String>,
-    published_at: Option<String>,
-    body: Option<String>,
-    prerelease: bool,
-    assets: Vec<GhAsset>,
+struct JenkinsJob {
+    builds: Vec<JenkinsBuild>,
 }
 
 #[derive(Debug, Deserialize)]
-struct GhAsset {
+struct JenkinsBuild {
+    id: String,
+    timestamp: u64, // Jenkins returns milliseconds since epoch
+    url: String,
+    artifacts: Vec<JenkinsArtifact>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JenkinsArtifact {
+    #[serde(rename = "fileName")]
+    file_name: String,
+    #[serde(rename = "relativePath")]
+    relative_path: String,
+}
+
+// --- GitHub API Models (Releases) ---
+#[derive(Debug, Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    name: Option<String>,
+    published_at: String,
+    body: Option<String>,
+    assets: Vec<GitHubAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubAsset {
     name: String,
     browser_download_url: String,
 }
 
-/// Spawns a background thread to fetch available builds from GitHub Releases.
-pub fn fetch_builds_async(sender: Sender<FetchResult>) {
+/// Spawns a background thread to fetch available builds for a specific channel.
+pub fn fetch_builds_async(channel: Channel, sender: Sender<FetchResult>) {
     thread::spawn(move || {
-        let result = fetch_builds_sync();
+        let result = fetch_builds_sync(channel);
         let _ = sender.send(result);
     });
 }
 
-fn fetch_builds_sync() -> FetchResult {
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        reqwest::header::ACCEPT,
-        "application/vnd.github+json".parse().unwrap(),
-    );
-    headers.insert(
-        "X-GitHub-Api-Version",
-        "2022-11-28".parse().unwrap(),
-    );
-
+fn fetch_builds_sync(channel: Channel) -> FetchResult {
     let client = match reqwest::blocking::Client::builder()
         .user_agent("ChroMapper-Version-Manager")
-        .default_headers(headers)
         .build()
     {
         Ok(c) => c,
         Err(e) => return FetchResult::Error(format!("Failed to initialize HTTP client: {e}")),
     };
 
-    let url = "https://api.github.com/repos/Caeden117/ChroMapper/releases";
-
-    match client.get(url).send() {
-        Ok(res) if res.status().is_success() => {
-            match res.json::<Vec<GhRelease>>() {
-                Ok(releases) => {
-                    let mut builds = Vec::new();
-
-                    for rel in releases {
-                        let channel = if rel.prerelease {
-                            Channel::Dev
-                        } else {
-                            Channel::Stable
-                        };
-
-                        let date = rel
-                            .published_at
-                            .as_deref()
-                            .and_then(|d| d.split('T').next())
-                            .unwrap_or("Unknown")
-                            .to_string();
-
-                        if let Some(asset) = find_os_asset(&rel.assets) {
-                            builds.push(Build {
-                                id: format!("gh-{}", rel.tag_name),
-                                version: rel.name.unwrap_or_else(|| rel.tag_name.clone()),
-                                channel,
-                                release_date: date,
-                                download_url: asset.browser_download_url.clone(),
-                                file_name: asset.name.clone(),
-                                changelog: rel
-                                    .body
-                                    .unwrap_or_else(|| "No changelog available.".to_string()),
-                            });
-                        }
-                    }
-
-                    FetchResult::Success(builds)
-                }
-                Err(e) => FetchResult::Error(format!("Failed to parse release JSON: {e}")),
+    // Route the request based on the requested channel
+    match channel {
+        Channel::Stable => {
+            match fetch_cdn_stable(&client) {
+                Ok(builds) => FetchResult::Success(builds),
+                Err(e) => FetchResult::Error(format!("CDN fetch failed: {e}")),
             }
         }
-        Ok(res) => {
-            let status = res.status();
-            if status == reqwest::StatusCode::FORBIDDEN {
-                FetchResult::Error("GitHub API returned 403 Forbidden. You may have hit the unauthenticated rate limit.".to_string())
-            } else {
-                FetchResult::Error(format!("GitHub API error: HTTP {status}"))
+        Channel::Dev => {
+            match fetch_jenkins_dev(&client) {
+                Ok(builds) => FetchResult::Success(builds),
+                Err(e) => FetchResult::Error(format!("Jenkins fetch failed: {e}")),
             }
         }
-        Err(e) => FetchResult::Error(format!("Network request failed: {e}")),
+        Channel::Release => {
+            match fetch_github_releases(&client) {
+                Ok(builds) => FetchResult::Success(builds),
+                Err(e) => FetchResult::Error(format!("GitHub releases fetch failed: {e}")),
+            }
+        }
     }
 }
 
-fn find_os_asset(assets: &[GhAsset]) -> Option<&GhAsset> {
-    let target_os = std::env::consts::OS;
+fn fetch_cdn_stable(client: &reqwest::blocking::Client) -> Result<Vec<Build>, String> {
+    // 1. Get the latest stable build number from the official CDN
+    let stable_url = "https://cm.topc.at/stable";
+    let res = client.get(stable_url).send().map_err(|e| e.to_string())?;
 
-    assets
-        .iter()
-        .find(|a| {
-            let lower = a.name.to_lowercase();
-            match target_os {
-                "windows" => lower.contains("win") || lower.ends_with(".zip"),
-                "linux" => lower.contains("linux") || lower.ends_with(".tar.gz") || lower.ends_with(".zip"),
-                "macos" => lower.contains("mac") || lower.contains("osx") || lower.ends_with(".dmg") || lower.ends_with(".zip"),
-                _ => true,
-            }
-        })
-        .or_else(|| assets.first())
+    if !res.status().is_success() {
+        return Err(format!("CDN HTTP Error: {}", res.status()));
+    }
+
+    let build_num = res.text().map_err(|e| e.to_string())?.trim().to_string();
+
+    // 2. Figure out OS-specific prefix and asset filename
+    let target_os = std::env::consts::OS;
+    let (prefix, filename) = match target_os {
+        "windows" => ("win", "ChroMapper.zip"),
+        "linux" => ("linux", "ChroMapper.tar.gz"),
+        "macos" => ("osx", "ChroMapper.zip"),
+        _ => return Err(format!("Unsupported OS: {}", target_os)),
+    };
+
+    // 3. Construct the direct CDN download URL
+    let download_url = format!("https://cm.topc.at/{}/{}/{}", prefix, build_num, filename);
+
+    let build = Build {
+        id: format!("cdn-{}", build_num),
+        version: format!("Stable Build {}", build_num),
+        channel: Channel::Stable,
+        release_date: "Latest Stable".to_string(),
+        download_url,
+        file_name: filename.to_string(),
+        changelog: "Fetched directly from the official ChroMapper CDN.".to_string(),
+    };
+
+    Ok(vec![build])
+}
+
+fn fetch_jenkins_dev(client: &reqwest::blocking::Client) -> Result<Vec<Build>, String> {
+    let jenkins_url = "https://jenkins.kirkstall.top-cat.me/job/ChroMapper/api/json?tree=builds[id,timestamp,url,artifacts[fileName,relativePath]]";
+    
+    let res = client.get(jenkins_url).send().map_err(|e| e.to_string())?;
+
+    if !res.status().is_success() {
+        return Err(format!("HTTP {}", res.status()));
+    }
+
+    let job: JenkinsJob = res.json().map_err(|e| e.to_string())?;
+    let mut builds = Vec::new();
+
+    for build in job.builds {
+        if let Some(artifact) = find_os_asset_jenkins(&build.artifacts) {
+            let date = format!("Timestamp: {}", build.timestamp);
+
+            builds.push(Build {
+                id: format!("jenkins-{}", build.id),
+                version: format!("Dev Build {}", build.id),
+                channel: Channel::Dev,
+                release_date: date,
+                download_url: format!("{}artifact/{}", build.url, artifact.relative_path),
+                file_name: artifact.file_name.clone(),
+                changelog: "Check Jenkins for commit history.".to_string(),
+            });
+        }
+    }
+
+    Ok(builds)
+}
+
+fn fetch_github_releases(client: &reqwest::blocking::Client) -> Result<Vec<Build>, String> {
+    let github_url = "https://api.github.com/repos/rcelyte/ChroMapper/releases";
+    
+    let res = client.get(github_url)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .map_err(|e| e.to_string())?;
+
+    if !res.status().is_success() {
+        return Err(format!("GitHub API Error: HTTP {}", res.status()));
+    }
+
+    let releases: Vec<GitHubRelease> = res.json().map_err(|e| e.to_string())?;
+    let mut builds = Vec::new();
+
+    for release in releases {
+        if let Some(asset) = find_os_asset_github(&release.assets) {
+            let version_name = release.name.unwrap_or_else(|| release.tag_name.clone());
+            
+            builds.push(Build {
+                id: format!("gh-{}", release.tag_name),
+                version: version_name,
+                channel: Channel::Release,
+                release_date: release.published_at,
+                download_url: asset.browser_download_url,
+                file_name: asset.name.clone(),
+                changelog: release.body.unwrap_or_else(|| "No changelog provided.".to_string()),
+            });
+        }
+    }
+
+    Ok(builds)
+}
+
+fn find_os_asset_jenkins(artifacts: &[JenkinsArtifact]) -> Option<&JenkinsArtifact> {
+    let target_os = std::env::consts::OS;
+    artifacts.iter().find(|a| {
+        let lower = a.file_name.to_lowercase();
+        match target_os {
+            "windows" => lower.contains("win") || lower.ends_with(".zip"),
+            "linux" => lower.contains("linux") || lower.ends_with(".tar.gz") || lower.ends_with(".zip"),
+            "macos" => lower.contains("mac") || lower.contains("osx") || lower.ends_with(".dmg") || lower.ends_with(".zip"),
+            _ => true,
+        }
+    }).or_else(|| artifacts.first())
+}
+
+fn find_os_asset_github(assets: &[GitHubAsset]) -> Option<&GitHubAsset> {
+    let target_os = std::env::consts::OS;
+    assets.iter().find(|a| {
+        let lower = a.name.to_lowercase();
+        match target_os {
+            "windows" => (lower.contains("win") || lower.contains("windows")) && (lower.ends_with(".zip") || lower.ends_with(".exe")),
+            "linux" => lower.contains("linux") && (lower.ends_with(".tar.gz") || lower.ends_with(".zip")),
+            "macos" => (lower.contains("mac") || lower.contains("osx") || lower.contains("darwin")) && (lower.ends_with(".zip") || lower.ends_with(".dmg")),
+            _ => true,
+        }
+    }).or_else(|| assets.first())
 }
 
 /// Spawns background thread to download archive AND automatically extract it.

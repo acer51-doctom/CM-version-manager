@@ -69,7 +69,7 @@ impl CmManagerApp {
         self.is_fetching_builds = true;
         let (tx, rx) = channel();
         self.fetch_receiver = Some(rx);
-        api::fetch_builds_async(tx);
+        api::fetch_builds_async(self.selected_channel, tx);
     }
 
     fn render_top_bar(&mut self, ctx: &egui::Context) {
@@ -213,13 +213,15 @@ impl CmManagerApp {
                     ui.selectable_value(&mut self.selected_channel, Channel::Dev, "Dev / Pre-release");
                 });
 
+            // THIS IS THE MODIFIED BLOCK FOR AUTO-REFRESHING
             if prev_channel != self.selected_channel {
                 logger::info(format!("Selected channel changed to: {}", self.selected_channel));
-                if let Some(first) = self.builds.iter().find(|b| b.channel == self.selected_channel) {
-                    self.selected_build_id = first.id.clone();
-                } else {
-                    self.selected_build_id.clear();
-                }
+                
+                // Automatically fetch the newly selected branch
+                self.trigger_build_fetch();
+                
+                // Clear out the selection box until the new branch builds arrive
+                self.selected_build_id.clear();
             }
             ui.end_row();
 
